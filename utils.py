@@ -1,0 +1,398 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from collections import Counter
+
+def intersection_over_union(boxes_prediction, ground_truth, box_format='midpoint'):
+    if box_format == 'midpoint':
+        
+        box1_x1 = boxes_prediction[..., 0:1] - boxes_prediction[..., 2:3] / 2
+        box1_y1 = boxes_prediction[..., 1:2] - boxes_prediction[..., 3:4] / 2
+        box1_x2 = boxes_prediction[..., 0:1] + boxes_prediction[..., 2:3] / 2
+        box1_y2 = boxes_prediction[..., 1:2] + boxes_prediction[..., 3:4] / 2
+        box2_x1 = ground_truth[..., 0:1] - ground_truth[..., 2:3] / 2
+        box2_y1 = ground_truth[..., 1:2] - ground_truth[..., 3:4] / 2
+        box2_x2 = ground_truth[..., 0:1] + ground_truth[..., 2:3] / 2
+        box2_y2 = ground_truth[..., 1:2] + ground_truth[..., 3:4] / 2
+        
+    elif box_format == 'corners':
+        
+        box1_x1, box1_y1, box1_x2, box1_y2 = boxes_prediction[..., 0:1], 
+        boxes_prediction[..., 1:2], boxes_prediction[..., 2:3], boxes_prediction[..., 3:4]
+        box2_x1, box2_y1, box2_x2, box2_y2 = ground_truth[..., 0:1], 
+        ground_truth[..., 1:2], ground_truth[..., 2:3], ground_truth[..., 3:4]
+
+    x1 = torch.max(box1_x1, box2_x1)
+    y1 = torch.max(box1_y1, box2_y1)
+    x2 = torch.min(box1_x2, box2_x2)
+    y2 = torch.min(box1_y2, box2_y2)
+    
+    # clamp(0) is for case when thay don`t intersect
+    # this comand use to avoid negative values if we din`t have intersection, we replace all negative values with 0
+    
+    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    
+    box1_area = (box1_x2 - box1_x1).clamp(0) * (box1_y2 - box1_y1).clamp(0)
+    box2_area = (box2_x2 - box2_x1).clamp(0) * (box2_y2 - box2_y1).clamp(0)
+
+    return intersection / (box1_area + box2_area - intersection + 1e-6)
+
+    
+def non_max_suppression(bboxes, iou_threshold, probability_threshold, box_format='corners'):
+    """
+    Applies Non-Maximum Suppression (NMS) to reduce the number of overlapping bounding boxes.
+
+    Args:
+    - bboxes (list of lists): List of bounding boxes, each box specified as [class_id, probability, x1, y1, x2, y2].
+    - iou_threshold (float): The Intersection-over-Union (IoU) threshold to use for determining overlap.
+    - probability_threshold (float): The probability threshold for filtering out bounding boxes.
+    - box_format (str): Format of the bounding boxes, 'corners' is used here (x1, y1, x2, y2).
+
+    Returns:
+    - List of bounding boxes after applying NMS.
+    """
+
+    # Filter boxes by the probability threshold
+    bboxes = [box for box in bboxes if box[1] > probability_threshold]
+    
+    # Sort boxes by the confidence scores in descending order
+    bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
+    
+    bboxes_after_nms = []
+    
+    while bboxes:
+        chosen_box = bboxes.pop(0)
+        
+        # Keep only boxes of different class or those of the same class but with IoU less than the threshold
+        bboxes = [
+            box for box in bboxes
+            if box[0] != chosen_box[0] or 
+            intersection_over_union(torch.tensor(chosen_box[2:]), torch.tensor(box[2:]), box_format) < iou_threshold
+        ]
+        
+        bboxes_after_nms.append(chosen_box)
+
+    return bboxes_after_nms
+
+# Mean Average Precision
+
+def mean_average_precision(prediction_boxes, true_boxes, iou_threshold = 0.5, box_format = 'corners', num_classes = 20):
+    # predictions_boxes (list): [[index, class_label, confidence, x1, y1, x2, y2], ...]
+    average_precisions = []
+    epsilon = 1e-6
+    
+    for c in range(num_classes):
+        detections = []
+        ground_truth = []
+        
+        for detection in prediction_boxes:
+            if detection[1] == c:
+                detections.append(detection)
+        
+        for true_box in true_boxes:
+            if true_box[1] == c:
+                ground_truth.append(true_box)
+        
+        # img 0 has 3 detections
+        # img 1 has 2 detections
+        # amount_bboxes = {0:3, 1:2}
+        amount_bboxes = Counter([gt[0] for gt in ground_truth])
+        
+        for key, val in amount_bboxes.items():
+            amount_bboxes[key] = torch.zeros(val)
+            
+        # amount_bboxes = {0:tensor([0., 0., 0.]), 1:tensor([0., 0.])}
+            
+        detections.sort(key = lambda x: x[2], reverse=True)
+        TP = torch.zeros((len(detections)))
+        FP = torch.zeros((len(detections)))
+        
+        total_true_bboxes = len(ground_truth)
+        
+        for detection_idx, detection in enumerate(detections):
+            ground_truth_img = [bbox for bbox in ground_truth if bbox[0] == detection[0]]
+            
+            
+            num_ground_truth_img = len(ground_truth_img)
+            best_iou = 0
+            
+            for idx, gt in enumerate(ground_truth_img):
+                iou = intersection_over_union(torch.tensor(detection[3:]),
+                                              torch.tensor(gt[3:]), box_format = box_format)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_idx = idx
+                
+                if best_iou > iou_threshold:
+                    if amount_bboxes[detection[0]][best_idx] == 0:
+                        TP[detection_idx] = 1
+                        amount_bboxes[detection[0]][best_idx] = 1
+                    else:
+                        FP[detection_idx] = 1
+                else:
+                    FP[detection_idx] = 1
+                    
+        TP_cumsum = torch.cumsum(TP, dim = 0)
+        FP_cumsum = torch.cumsum(FP, dim = 0)
+        recalls = TP_cumsum / (total_true_bboxes + epsilon)
+        precisions = torch.divide(TP_cumsum, (TP_cumsum + FP_cumsum + epsilon))
+        precisions = torch.cat((torch.tensor([1]), precisions))
+        recalls = torch.cat((torch.tensor([0]), recalls))
+        average_precisions.append(torch.trapz(precisions, recalls))
+        
+    return sum(average_precisions) / len(average_precisions)
+        
+
+
+def save_checkpoint(state, filename = "checkpoint.pth.tar"):
+    print("=> Saving checkpoint")
+    torch.save(state, filename)
+
+def load_checkpoint(checkpoint, model, optimizer):
+    print('=> Loading checkpoint')
+    model.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    
+    
+# checkpoint = {
+#     'epoch': epoch,  # Number of current epoch
+#     'state_dict': model.state_dict(),  # model state (weights and biases)
+#     'optimizer': optimizer.state_dict(),  # optimizer state (learning rate, momentum, etc.)
+#     'best_accuracy': best_accuracy,  # best accuracy
+#     'loss_history': loss_history, history of loss
+#     'accuracy_history': accuracy_history  # history of accuracy
+# }
+
+def convert_cellboxes(predictions, S=7):
+    """
+    Converts bounding boxes output from Yolo with
+    an image split size of S into entire image ratios
+    rather than relative to cell ratios. Tried to do this
+    vectorized, but this resulted in quite difficult to read
+    code... Use as a black box? Or implement a more intuitive,
+    using 2 for loops iterating range(S) and convert them one
+    by one, resulting in a slower but more readable implementation.
+    """
+
+    predictions = predictions.to("cpu")
+    batch_size = predictions.shape[0]
+    predictions = predictions.reshape(batch_size, 7, 7, 30)
+    bboxes1 = predictions[..., 21:25]
+    bboxes2 = predictions[..., 26:30]
+    scores = torch.cat(
+        (predictions[..., 20].unsqueeze(0), predictions[..., 25].unsqueeze(0)), dim=0
+    )
+    best_box = scores.argmax(0).unsqueeze(-1)
+    best_boxes = bboxes1 * (1 - best_box) + best_box * bboxes2
+    cell_indices = torch.arange(7).repeat(batch_size, 7, 1).unsqueeze(-1)
+    x = 1 / S * (best_boxes[..., :1] + cell_indices)
+    y = 1 / S * (best_boxes[..., 1:2] + cell_indices.permute(0, 2, 1, 3))
+    w_y = 1 / S * best_boxes[..., 2:4]
+    converted_bboxes = torch.cat((x, y, w_y), dim=-1)
+    predicted_class = predictions[..., :20].argmax(-1).unsqueeze(-1)
+    best_confidence = torch.max(predictions[..., 20], predictions[..., 25]).unsqueeze(
+        -1
+    )
+    converted_preds = torch.cat(
+        (predicted_class, best_confidence, converted_bboxes), dim=-1
+    )
+
+    return converted_preds
+
+
+def cellboxes_to_boxes(out, S=7):
+    converted_pred = convert_cellboxes(out).reshape(out.shape[0], S * S, -1)
+    converted_pred[..., 0] = converted_pred[..., 0].long()
+    all_bboxes = []
+
+    for ex_idx in range(out.shape[0]):
+        bboxes = []
+
+        for bbox_idx in range(S * S):
+            bboxes.append([x.item() for x in converted_pred[ex_idx, bbox_idx, :]])
+        all_bboxes.append(bboxes)
+
+    return all_bboxes 
+
+
+def get_bboxes(
+    loader,
+    model,
+    iou_threshold,
+    threshold,
+    pred_format="cells",
+    box_format="midpoint",
+    device="cuda",
+):
+    all_pred_boxes = []
+    all_true_boxes = []
+
+    # make sure model is in eval before get bboxes
+    model.eval()
+    train_idx = 0
+
+    for batch_idx, (x, labels) in enumerate(loader):
+        x = x.to(device)
+        labels = labels.to(device)
+
+        with torch.no_grad():
+            predictions = model(x)
+
+        batch_size = x.shape[0]
+        true_bboxes = cellboxes_to_boxes(labels)
+        bboxes = cellboxes_to_boxes(predictions)
+
+        for idx in range(batch_size):
+            nms_boxes = non_max_suppression(
+                bboxes[idx],
+                iou_threshold=iou_threshold,
+                probability_threshold=threshold,
+                box_format=box_format,
+            )
+
+
+            #if batch_idx == 0 and idx == 0:
+            #    plot_image(x[idx].permute(1,2,0).to("cpu"), nms_boxes)
+            #    print(nms_boxes)
+
+            for nms_box in nms_boxes:
+                all_pred_boxes.append([train_idx] + nms_box)
+
+            for box in true_bboxes[idx]:
+                # many will get converted to 0 pred
+                if box[1] > threshold:
+                    all_true_boxes.append([train_idx] + box)
+
+            train_idx += 1
+
+    model.train()
+    return all_pred_boxes, all_true_boxes
+        
+        
+'''      
+def plot_image(image, boxes):
+    """Plots predicted bounding boxes on the image"""
+    im = np.array(image)
+    height, width, _ = im.shape
+
+    # Create figure and axes
+    fig, ax = plt.subplots(1)
+    # Display the image
+    ax.imshow(im)
+
+    # box[0] is x midpoint, box[2] is width
+    # box[1] is y midpoint, box[3] is height
+
+    # Create a Rectangle potch
+    for box in boxes:
+        box = box[2:]
+        assert len(box) == 4, "Got more values than in x, y, w, h, in a box!"
+        upper_left_x = box[0] - box[2] / 2
+        upper_left_y = box[1] - box[3] / 2
+        rect = patches.Rectangle(
+            (upper_left_x * width, upper_left_y * height),
+            box[2] * width,
+            box[3] * height,
+            linewidth=1,
+            edgecolor="r",
+            facecolor="none",
+        )
+        # Add the patch to the Axes
+        ax.add_patch(rect)
+
+    plt.show()'''
+    
+def plotimage(image, boxes):
+    """Plots predicted bounding boxes on the image"""
+    im = np.array(image)
+    print(f"Image shape: {im.shape}")
+    height, width = im.shape[0], im.shape[1]
+
+    # Create figure and axes
+    fig, ax = plt.subplots(1)
+    # Display the image
+    ax.imshow(im)
+
+    # box[0] is x midpoint, box[2] is width
+    # box[1] is y midpoint, box[3] is height
+
+    # Create a Rectangle potch
+    for box in boxes:
+        box = box[2:]
+        assert len(box) == 4, "Got more values than in x, y, w, h, in a box!"
+        upper_left_x = box[0] - box[2] / 2
+        upper_left_y = box[1] - box[3] / 2
+        rect = patches.Rectangle(
+            (upper_left_x * width, upper_left_y * height),
+            box[2] * width,
+            box[3] * height,
+            linewidth=1,
+            edgecolor="r",
+            facecolor="none",
+        )
+        # Add the patch to the Axes
+        ax.add_patch(rect)
+
+    plt.show()
+
+def plot_image(image, boxes):
+    class_dict = {
+    0: "aeroplane",
+    1: "bicycle",
+    2: "bird",
+    3: "boat",
+    4: "bottle",
+    5: "bus",
+    6: "car",
+    7: "cat",
+    8: "chair",
+    9: "cow",
+    10: "diningtable",
+    11: "dog",
+    12: "horse",
+    13: "motorbike",
+    14: "person",
+    15: "pottedplant",
+    16: "sheep",
+    17: "sofa",
+    18: "train",
+    19: "tvmonitor"
+    }
+
+    """Plots predicted bounding boxes on the image"""
+    im = np.array(image)
+    height, width, _ = im.shape
+
+    # Create figure and axes
+    fig, ax = plt.subplots(1)
+    # Display the image
+    ax.imshow(im)
+
+    # box[0] is x midpoint, box[2] is width
+    # box[1] is y midpoint, box[3] is height
+    
+    # Create a Rectangle potch
+    for box in boxes:
+        precision = np.round(box[1], 2)
+        label = class_dict[box[0]]
+        box = box[2:]
+        assert len(box) == 4, "Got more values than in x, y, w, h, in a box!"
+        upper_left_x = box[0] - box[2] / 2
+        upper_left_y = box[1] - box[3] / 2
+        rect = patches.Rectangle(
+            (upper_left_x * width, upper_left_y * height),
+            box[2] * width,
+            box[3] * height,
+            linewidth=1,
+            edgecolor="r",
+            facecolor="none",
+        )
+        # Add the patch to the Axes
+        upper_right_x = upper_left_x + box[2]
+        ax.add_patch(rect)
+        ax.text(upper_left_x * width, upper_left_y * height, label, color='white', fontsize=8, 
+                bbox=dict(facecolor='red', alpha=0.5))
+        ax.text(upper_right_x * width, upper_left_y * height, precision , color='white', fontsize=8,
+                bbox=dict(facecolor='red', alpha=0.5))
+    plt.show()
